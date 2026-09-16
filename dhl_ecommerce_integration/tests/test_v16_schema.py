@@ -164,7 +164,10 @@ class TestV16Schema(unittest.TestCase):
 		try:
 			combined = frappe.get_doc("File", {"file_url": result.pdf_urls[-1]})
 			self.assertTrue(combined.is_private)
-			self.assertEqual(len(PdfReader(io.BytesIO(combined.get_content())).pages), 2)
+			# File.get_content() decodes UTF-8-compatible files to str. Read the
+			# stored PDF in binary mode so the assertion checks its original bytes.
+			with open(combined.get_full_path(), "rb") as pdf_file:
+				self.assertEqual(len(PdfReader(pdf_file).pages), 2)
 		finally:
 			for name in files:
 				frappe.delete_doc("File", name, ignore_permissions=True)
