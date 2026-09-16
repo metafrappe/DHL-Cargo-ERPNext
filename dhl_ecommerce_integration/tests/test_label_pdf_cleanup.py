@@ -2,6 +2,8 @@
 # For license information, please see license.txt
 
 import frappe
+import io
+from pypdf import PdfWriter
 from unittest.mock import patch, MagicMock
 from dhl_ecommerce_integration.utils import _delete_stale_label_files, _generate_pdfs_for_dn
 
@@ -22,7 +24,8 @@ def test_delete_stale_filter_shape():
 	assert dctCall["pluck"] == "name"
 	assert dctCall["filters"]["attached_to_doctype"] == "Delivery Note"
 	assert dctCall["filters"]["attached_to_name"] == "DN-TEST001"
-	assert "DHL_Kargo_Etiketi_DN-TEST001_%" == dctCall["filters"]["file_name"][1]
+	# The prefix includes both per-piece and combined PDFs.
+	assert "DHL_Kargo_Etiketi_DN-TEST001%" == dctCall["filters"]["file_name"][1]
 
 
 def test_delete_happy_path_three_files():
@@ -100,10 +103,15 @@ def test_conversion_failure_blocks_everything():
 
 def test_full_success_three_pieces_ordering():
 	lstCallLog = []
+	writer = PdfWriter()
+	writer.add_blank_page(width=288, height=288)
+	buffer = io.BytesIO()
+	writer.write(buffer)
+	pdf_bytes = buffer.getvalue()
 
 	def _mock_convert(lstZpl):
 		lstCallLog.append(("convert", lstZpl[0]))
-		return b"%PDF-1.4 fake content"
+		return pdf_bytes
 
 	def _mock_delete_stale(strDNName):
 		lstCallLog.append(("delete", strDNName))
@@ -129,7 +137,7 @@ def test_full_success_three_pieces_ordering():
 		dctResult = _generate_pdfs_for_dn("DN-TEST005")
 
 	assert dctResult.op_result is True
-	assert len(dctResult.lst_file_urls) == 3
+	assert len(dctResult.lst_file_urls) == 4
 	assert dctResult.int_deleted == 2
 	assert lstCallLog[0] == ("convert", "^XA p1 ^XZ")
 	assert lstCallLog[1] == ("convert", "^XA p2 ^XZ")
@@ -138,6 +146,7 @@ def test_full_success_three_pieces_ordering():
 	assert lstCallLog[4] == ("attach", "DHL_Kargo_Etiketi_DN-TEST005_Parca1.pdf")
 	assert lstCallLog[5] == ("attach", "DHL_Kargo_Etiketi_DN-TEST005_Parca2.pdf")
 	assert lstCallLog[6] == ("attach", "DHL_Kargo_Etiketi_DN-TEST005_Parca3.pdf")
+	assert lstCallLog[7] == ("attach", "DHL_Kargo_Etiketi_DN-TEST005.pdf")
 
 
 def test_empty_barcode_zpl_rows_skipped():

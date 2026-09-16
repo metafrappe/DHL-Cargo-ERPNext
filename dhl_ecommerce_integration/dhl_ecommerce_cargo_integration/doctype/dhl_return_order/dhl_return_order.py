@@ -8,7 +8,7 @@ from frappe.utils import today
 from dhl_ecommerce_integration.utils import (
 	_build_create_return_order_payload,
 	_send_create_return_order,
-	get_token,
+	_get_token as get_token,
 	uppercase_tr,
 )
 
@@ -17,7 +17,7 @@ class DHLReturnOrder(Document):
 	pass
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def create_return_order(docname=None, sales_order_name=None, item_code=None, return_qty=None):
 	dctResult = frappe._dict({
 		"op_result": False,
@@ -39,6 +39,7 @@ def create_return_order(docname=None, sales_order_name=None, item_code=None, ret
 	docReturn = None
 	if docname:
 		docReturn = frappe.get_doc("DHL Return Order", docname)
+		docReturn.check_permission("write")
 		docSO = frappe.get_doc("Sales Order", docReturn.sales_order)
 		strItemCode = docReturn.item_code
 		dReturnQty = int(docReturn.return_qty)
@@ -50,6 +51,8 @@ def create_return_order(docname=None, sales_order_name=None, item_code=None, ret
 		dReturnQty = int(return_qty)
 		docSO = frappe.get_doc("Sales Order", sales_order_name)
 		strItemCode = item_code
+
+	docSO.check_permission("read")
 
 	# --- shared validation ---
 	dctValidation = _validate_return_request(docSO.name, strItemCode, dReturnQty)

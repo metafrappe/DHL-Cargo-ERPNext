@@ -14,3 +14,7 @@ __pycache__
 .claude/
 .opencode/
 .playwright-mcp
+.venv/
+.validation/
+.ruff_cache/
+dist/

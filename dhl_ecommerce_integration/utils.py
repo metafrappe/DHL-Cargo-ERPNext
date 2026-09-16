@@ -6,7 +6,7 @@ import re
 import frappe, json, requests, base64, time
 from datetime import datetime, timedelta, timezone
 from frappe import msgprint, _
-from frappe.utils import get_datetime_str
+from frappe.utils import get_datetime, get_datetime_str, now_datetime
 from pypdf import PdfReader, PdfWriter
 from urllib.parse import quote
 
@@ -40,6 +40,16 @@ RETURN_DHL_STATUS_MAP = {
 }
 
 
+def _redact_secrets(value):
+	"""Redact credentials before serializing API diagnostics."""
+	secret_keys = {"authorization", "x-ibm-client-secret", "password", "jwt", "token", "refreshtoken", "refresh_token"}
+	if isinstance(value, dict):
+		return {key: "[redacted]" if key.lower() in secret_keys else _redact_secrets(item) for key, item in value.items()}
+	if isinstance(value, list):
+		return [_redact_secrets(item) for item in value]
+	return value
+
+
 def _log_api_request(docDHLSettings, strTitle, strMethod, strURL, dctHeaders, dctPayload=None):
 	if docDHLSettings.enable_detailed_logs:
 		lstExcludeKeys = ("Authorization", "x-ibm-client-secret")
@@ -51,7 +61,7 @@ def _log_api_request(docDHLSettings, strTitle, strMethod, strURL, dctHeaders, dc
 		}
 		if dctPayload is not None:
 			dctLog["payload"] = dctPayload
-		frappe.log_error(strTitle, frappe.as_json(dctLog))
+		frappe.log_error(strTitle, frappe.as_json(_redact_secrets(dctLog)))
 
 def _is_jwt_exp_valid(strJWT):
 	"""Decode the JWT's exp claim and check if the token is still valid.
@@ -66,15 +76,21 @@ def _is_jwt_exp_valid(strJWT):
 			if "exp" in dctPayload:
 				dtExpUTC = datetime.fromtimestamp(dctPayload["exp"], tz=timezone.utc)
 				# Add 5-minute safety margin — refresh before actual expiry
-				dtExpWithMargin = dtExpUTC + timedelta(minutes=5)
+				dtExpWithMargin = dtExpUTC - timedelta(minutes=5)
 				blnValid = datetime.now(tz=timezone.utc) < dtExpWithMargin
 	except Exception:
 		# If decoding fails, don't block — let the API validate
 		pass
 	return blnValid
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def get_token(blnForce=False):
+	"""Expose credentials only to administrators; hooks use the internal helper."""
+	frappe.only_for("System Manager")
+	return _get_token(blnForce=frappe.utils.cint(blnForce))
+
+
+def _get_token(blnForce=False):
 	dctResult = frappe._dict({
 		"op_result": False,
 		"op_message": "",
@@ -93,8 +109,8 @@ def get_token(blnForce=False):
 			# field from the API may not exactly match the JWT's embedded exp claim
 			blnCacheValid = False
 			try:
-				dtExpire = datetime.strptime(strExpireDate, "%Y-%m-%d %H:%M:%S")
-				dtNow = datetime.strptime(frappe.utils.now()[:19], "%Y-%m-%d %H:%M:%S")
+				dtExpire = get_datetime(strExpireDate)
+				dtNow = now_datetime()
 				blnCacheValid = dtExpire > dtNow
 			except Exception:
 				blnCacheValid = False
@@ -111,17 +127,26 @@ def get_token(blnForce=False):
 				return dctResult
 
 
+	if not all(docDHLSettings.get(field) for field in ("web_service_url", "customer_number", "client_id")):
+		dctResult.op_message = _("Configure the DHL service URL, customer number, and client ID first")
+		return dctResult
+	password = docDHLSettings.get_password("password", raise_exception=False)
+	client_secret = docDHLSettings.get_password("client_secret", raise_exception=False)
+	if not password or not client_secret:
+		dctResult.op_message = _("Configure the DHL password and client secret first")
+		return dctResult
+
 	strTokenURL = docDHLSettings.web_service_url + "/mngapi/api/token"
 
 	dctPayload = {
 		"customerNumber": docDHLSettings.customer_number,
-		"password": docDHLSettings.get_password("password"),
+		"password": password,
 		"identityType": 1
 	}
 
 	dctHeaders = {
 		"x-ibm-client-id": docDHLSettings.client_id,
-		"x-ibm-client-secret": docDHLSettings.get_password("client_secret"),
+		"x-ibm-client-secret": client_secret,
 		"Content-Type": "application/json"
 	}
 
@@ -130,11 +155,10 @@ def get_token(blnForce=False):
 		response = requests.post(strTokenURL, json=dctPayload, headers=dctHeaders, timeout=30)
 
 		if docDHLSettings.enable_detailed_logs:
-			frappe.log_error("DHL Get Token Response", frappe.as_json({
+			frappe.log_error("DHL Get Token Response", frappe.as_json(_redact_secrets({
 				"status_code": response.status_code,
-				"headers": dict(response.headers),
-				"body": response.text
-			}))
+				"body": response.json()
+			})))
 
 		dctResponse = response.json()
 		strJWT = dctResponse.get("jwt")
@@ -182,8 +206,9 @@ def get_token(blnForce=False):
 
 	return dctResult
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def get_cities_and_districts():
+	frappe.only_for("System Manager")
 	dctResult = frappe._dict({
 		"op_result": False,
 		"op_message": ""
@@ -321,6 +346,8 @@ def create_recipient(doc, method):
 
 	if method == "on_submit":
 		docDHLSettings = frappe.get_single("DHL Cargo Settings")
+		if not (docDHLSettings.enabled and docDHLSettings.sales_order_creates_recipient):
+			return dctResult
 		if docDHLSettings.enabled and docDHLSettings.sales_order_creates_recipient:
 			docAddress = frappe.get_doc("Address", doc.shipping_address_name)
 			docAddress.city = uppercase_tr(docAddress.city)
@@ -346,8 +373,8 @@ def create_recipient(doc, method):
 					dctResult.op_message = "District not mapped in DHL Cargo Settings: {0} for Sales Order {1}!".format(docAddress.county or "", doc.name)
 					frappe.log_error("DHL Create Recipient Error", dctResult.op_message)
 				else:
-					# get_token() handles all cache/expiry/refresh logic internally
-					dctTokenResult = get_token()
+					# _get_token() handles all cache/expiry/refresh logic internally
+					dctTokenResult = _get_token()
 					if not dctTokenResult.op_result:
 						dctResult.op_message = "Get Token failed: " + dctTokenResult.op_message
 						frappe.log_error("DHL Create Recipient Error", dctResult.op_message)
@@ -370,7 +397,7 @@ def _send_create_recipient(doc, docDHLSettings, docAddress, strCityCode, strDist
 	strEmail = docAddress.email_id or docDHLSettings.default_email or ""
 	docCustomer = frappe.get_doc("Customer", doc.customer)
 
-	strTaxOffice = (docCustomer.custom_tax_office or "")[:20]
+	strTaxOffice = (docCustomer.get("custom_tax_office") or "")[:20]
 	strTaxNumber = (docCustomer.tax_id or "")[:20]
 
 	dctPayload = {
@@ -427,7 +454,7 @@ def _send_create_recipient(doc, docDHLSettings, docAddress, strCityCode, strDist
 
 
 def on_submit_delivery_note(doc, method):
-	if doc.custom_ld_delivery_method == "DHL":
+	if doc.get("custom_ld_delivery_method") == "DHL":
 		if frappe.db.get_single_value("DHL Cargo Settings", "enabled"):
 			if not doc.dhl_barcodes or len(doc.dhl_barcodes) == 0:
 				frappe.throw(_("DHL Barcode rows (desi/kg) must be filled before submitting a DHL Delivery Note."))
@@ -454,7 +481,7 @@ def _create_order_on_submit(doc):
 				"kg": docRow.kg or 1,
 			})
 
-		dctTokenResult = get_token()
+		dctTokenResult = _get_token()
 		if not dctTokenResult.op_result:
 			frappe.throw("Get Token failed: " + dctTokenResult.op_message)
 		else:
@@ -484,7 +511,7 @@ def _create_order_on_submit(doc):
 	return dctResult
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def create_barcode(strDeliveryNoteName, lstParcels):
 	dctResult = frappe._dict({
 		"op_result": False,
@@ -499,11 +526,12 @@ def create_barcode(strDeliveryNoteName, lstParcels):
 		frappe.throw("DHL Cargo Settings is not enabled!")
 	else:
 		docDN = frappe.get_doc("Delivery Note", strDeliveryNoteName)
-		if docDN.custom_ld_delivery_method == "DHL":
+		docDN.check_permission("write")
+		if docDN.get("custom_ld_delivery_method") == "DHL":
 			if not docDN.dhl_reference_id:
 				frappe.throw("CreateOrder must be completed before barcode generation for {0}".format(docDN.name))
 			else:
-				dctTokenResult = get_token()
+				dctTokenResult = _get_token()
 				if not dctTokenResult.op_result:
 					frappe.throw("Get Token failed: " + dctTokenResult.op_message)
 				else:
@@ -560,6 +588,7 @@ def _sync_barcode_rows(lstRows, lstBarcodes, lstParcels, strDocName):
 		dctParcel = lstParcels[dIdx] if dIdx < len(lstParcels) else {}
 		strPieceBarcode = _make_piece_barcode(strDocName, dPiece, dTotalPieces)
 		dctRowData = {
+			"idx": dIdx + 1,
 			"barcode": strPieceBarcode,
 			"barcode_zpl": dctEntry.get("value", ""),
 			"piece_number": dPiece,
@@ -944,16 +973,17 @@ def _generate_pdfs_for_dn(strDNName):
 	return dctResult
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def generate_dhl_pdfs(strDeliveryNoteName):
 	docDN = frappe.get_doc("Delivery Note", strDeliveryNoteName)
-	if not (docDN.custom_ld_delivery_method == "DHL" and docDN.dhl_barcodes):
+	docDN.check_permission("write")
+	if not (docDN.get("custom_ld_delivery_method") == "DHL" and docDN.dhl_barcodes):
 		frappe.throw("No DHL barcodes found for this Delivery Note")
 	dctResult = _generate_pdfs_for_dn(strDeliveryNoteName)
 	return dctResult
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def cancel_dhl_order(strReferenceId):
 	"""Cancels a DHL shipment by reference ID via the cancelshipment API."""
 	dctResult = frappe._dict({"op_result": False, "op_message": ""})
@@ -961,16 +991,21 @@ def cancel_dhl_order(strReferenceId):
 	if not strReferenceId or not strReferenceId.strip():
 		dctResult.op_message = "Reference ID is required"
 	else:
-		strReferenceId = strReferenceId.strip().upper()
+		strReferenceId = strReferenceId.strip()
+		name = frappe.db.get_value("Delivery Note", {"dhl_reference_id": strReferenceId}, "name")
+		if not name:
+			frappe.throw(_("Delivery Note for this DHL reference was not found"), frappe.DoesNotExistError)
+		docDN = frappe.get_doc("Delivery Note", name)
+		docDN.check_permission("write")
 		docDHLSettings = frappe.get_single("DHL Cargo Settings")
 		if not docDHLSettings.enabled:
 			dctResult.op_message = "DHL Cargo Settings is not enabled"
 		else:
-			dctTokenResult = get_token()
+			dctTokenResult = _get_token()
 			if not dctTokenResult.op_result:
 				dctResult.op_message = "Get Token failed: " + dctTokenResult.op_message
 			else:
-				strShipmentId = frappe.db.get_value("Delivery Note", strReferenceId, "dhl_shipment_id") or ""
+				strShipmentId = docDN.dhl_shipment_id or ""
 				dctPayload = {"referenceId": strReferenceId, "shipmentId": strShipmentId}
 				dctHeaders = {
 					"x-ibm-client-id": docDHLSettings.client_id,
@@ -1001,7 +1036,6 @@ def cancel_dhl_order(strReferenceId):
 					dctResult.op_message = "Exception during cancelShipment: " + frappe.get_traceback()
 					frappe.log_error("DHL Cancel Shipment Exception", dctResult.op_message)
 
-				docDN = frappe.get_doc("Delivery Note", strReferenceId)
 				strStatus = "Başarılı" if dctResult.op_result else "Başarısız"
 				docDN.add_comment("Comment", "DHL Kargo İptal — {0}: {1}".format(strStatus, dctResult.op_message))
 
@@ -1135,7 +1169,7 @@ def _send_create_return_order(dctPayload, dctHeaders, strURL, docDHLSettings):
 	return dctResult
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def check_return_status(strDHLReturnOrderName):
 	dctResult = frappe._dict({
 		"op_result": False,
@@ -1146,6 +1180,7 @@ def check_return_status(strDHLReturnOrderName):
 		frappe.throw(frappe._("Not permitted"), frappe.PermissionError)
 
 	docReturn = frappe.get_doc("DHL Return Order", strDHLReturnOrderName)
+	docReturn.check_permission("write")
 	if not docReturn.reference_id:
 		dctResult.op_message = "No reference ID found"
 	else:
@@ -1153,7 +1188,7 @@ def check_return_status(strDHLReturnOrderName):
 		if not docDHLSettings.enabled:
 			dctResult.op_message = "DHL Cargo Settings is not enabled"
 		else:
-			dctTokenResult = get_token()
+			dctTokenResult = _get_token()
 			if not dctTokenResult.op_result:
 				dctResult.op_message = "Get Token failed: " + dctTokenResult.op_message
 			else:
@@ -1181,7 +1216,7 @@ def check_return_status(strDHLReturnOrderName):
 						strInfoMessage = dctData.get("shipmentStatus", "") if isinstance(dctData, dict) else ""
 						strNewStatus = RETURN_DHL_STATUS_MAP.get(dStatusCode, "")
 					elif objResponse.status_code == 401:
-						dctRefreshResult = get_token(blnForce=True)
+						dctRefreshResult = _get_token(blnForce=True)
 						if dctRefreshResult.op_result:
 							dctHeaders["Authorization"] = "Bearer " + dctRefreshResult.token
 							objResponse2 = requests.get(strStatusURL, headers=dctHeaders, timeout=30)

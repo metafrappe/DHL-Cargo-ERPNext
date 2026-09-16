@@ -120,7 +120,6 @@ def run_install_setup():
     ensure_delivery_method_has_dhl()
     seed_dhl_delivery_types()
     seed_dhl_payment_types()
-    frappe.db.commit()
 
 
 def ensure_delivery_method_has_dhl():
@@ -155,10 +154,15 @@ def ensure_delivery_method_has_dhl():
     docfield = frappe.get_meta(doctype).get_field(fieldname)
 
     if not docfield:
-        frappe.log_error(
-            title="DHL Integration Install Warning",
-            message=f"{doctype}.{fieldname} was not found while trying to add DHL option.",
-        )
+        # This field existed only in the original site's customizations. Create
+        # it on clean ERPNext sites, without overwriting existing carrier choices.
+        create_custom_fields({doctype: [{
+            "fieldname": fieldname,
+            "fieldtype": "Select",
+            "label": "Delivery Method",
+            "options": "\nDHL",
+            "insert_after": "dhl_cargo_section",
+        }]})
         return
 
     has_leading_blank, options = split_options(docfield.options)

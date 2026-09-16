@@ -7,7 +7,7 @@ import requests
 from urllib.parse import quote
 from frappe.utils import add_to_date, now_datetime
 
-from dhl_ecommerce_integration.utils import get_token, _log_api_request, RETURN_DHL_STATUS_MAP
+from dhl_ecommerce_integration.utils import _get_token as get_token, _log_api_request, RETURN_DHL_STATUS_MAP
 
 DHL_STATUS_MAP = {
 	1: "Pending",

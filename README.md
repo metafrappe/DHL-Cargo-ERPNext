@@ -2,10 +2,10 @@
 
 > **Automate DHL eCommerce (MNG Kargo) shipment creation, barcode label generation, and ZPL printing directly from ERPNext Delivery Notes — with a single click.**
 
-[![ERPNext](https://img.shields.io/badge/ERPNext-v14%2B-blue)](https://erpnext.com)
-[![Frappe Framework](https://img.shields.io/badge/Frappe-v14%2B-0089FF)](https://frappeframework.com)
+[![ERPNext](https://img.shields.io/badge/ERPNext-v16-blue)](https://erpnext.com)
+[![Frappe Framework](https://img.shields.io/badge/Frappe-v16-0089FF)](https://frappeframework.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-yellow)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.14-yellow)](https://python.org)
 
 ---
 
@@ -49,13 +49,49 @@ Base URLs:
 
 ## Requirements
 
-- **Frappe Framework** v14 or v15
-- **ERPNext** v14 or v15
-- **Python** 3.10+
+- **Frappe Framework** v16
+- **ERPNext** v16
+- **Python** 3.14.x
 - A valid **DHL eCommerce / MNG Kargo** customer account
 - API credentials
 
 ---
+
+## Version 16 fork
+
+This branch targets Frappe/ERPNext 16 and requires ERPNext to be installed first.
+The upstream baseline is `94f30b8f6f410400e1cdd1e30e2897dbb736e21b`.
+
+```sh
+bench get-app --branch version-16 https://github.com/metafrappe/DHL-Cargo-ERPNext.git
+bench --site your-site install-app dhl_ecommerce_integration
+bench --site your-site migrate
+```
+
+Installation adds the Delivery Method selector on clean sites and appends `DHL`
+to existing choices without replacing them. DHL is disabled by default. Configure
+credentials and city/district mappings in **DHL Cargo Settings** as a System Manager,
+then enable it. Select **DHL**, fill the parcel rows, and submit a Delivery Note to
+create the carrier order; generate labels from the submitted document afterward.
+
+The settings and token/region-refresh endpoints require System Manager. Shipment
+and label actions enforce document write permission. Internal document hooks and
+scheduled tracking use the credential helper without exposing it as an API.
+
+On a disposable test site with `allow_tests` enabled:
+
+```sh
+bench --site test-site execute dhl_ecommerce_integration.tests.v16_smoke.run
+```
+
+The runner executes the original barcode/PDF regressions and new real-schema,
+mocked-carrier, permission, disabled/configuration and credential-redaction tests.
+Unexpected HTTP requests are blocked; no real shipments are created. Failures
+raise an exception for a nonzero CI exit. The schema tests roll back their records
+and delete generated files, so the suite can be repeated after migration.
+
+See the [Frappe v16 migration guide](https://github.com/frappe/frappe/wiki/Migrating-to-version-16)
+for the Python/Node runtime and database API changes.
 
 ## Configuration
 
@@ -69,7 +105,7 @@ Go to **ERPNext → DHL Cargo Settings** and fill in:
 | Password | Your MNG Kargo API password |
 | IBM Client ID | `x-ibm-client-id` from ApiZone portal |
 | IBM Client Secret | `x-ibm-client-secret` from ApiZone portal |
-| Use Test Environment | Enable for sandbox testing |
+| Web Service URL | Set the test or production base URL explicitly |
 
 > ⚠️ Never hardcode credentials. All sensitive values are stored in the Settings DocType and never committed to version control.
 
